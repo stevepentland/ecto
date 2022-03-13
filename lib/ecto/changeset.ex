@@ -214,8 +214,8 @@ defmodule Ecto.Changeset do
   Changesets can also be used with data in a plain map, by following the same API:
 
       data  = %{}
-      types = %{name: :string}
-      params = %{name: "Callum"}
+      types = %{name: :string, favorite_color: Ecto.ParameterizedType.init(Ecto.Enum, values: [:red, :white])}
+      params = %{name: "Callum", favorite_color: "red"}
       changeset =
         {data, types}
         |> Ecto.Changeset.cast(params, Map.keys(types))
