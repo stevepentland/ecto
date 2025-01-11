@@ -474,4 +474,26 @@ defmodule Ecto.Repo.BelongsToTest do
     refute_received {:transaction, _}
     refute_received {:rollback, _}
   end
+
+  test "ignore not loaded assoc on insert" do
+    schema = %MySchema{}
+    %{assoc: %Ecto.Association.NotLoaded{}} = schema
+    loaded = put_in schema.__meta__.state, :loaded
+    TestRepo.insert!(loaded)
+  end
+
+  test "reset assoc when foreign key update results in a mismatch" do
+    schema = TestRepo.insert!(%MySchema{assoc_id: 1, assoc: %MyAssoc{id: 1}})
+    assert schema.assoc_id == 1
+    assert %MyAssoc{id: 1} = schema.assoc
+
+    updated_schema =
+      schema
+      |> Ecto.Changeset.change(%{assoc_id: 2})
+      |> TestRepo.update!()
+
+
+    assert updated_schema.assoc_id == 2
+    assert %Ecto.Association.NotLoaded{} = updated_schema.assoc
+  end
 end

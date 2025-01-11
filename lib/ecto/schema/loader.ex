@@ -24,7 +24,7 @@ defmodule Ecto.Schema.Loader do
   @doc """
   Loads data coming from the user/embeds into schema.
 
-  Assumes data does not all belongs to schema/struct
+  Assumes data does not all belong to schema/struct
   and that it may also require source-based renaming.
   """
   def unsafe_load(schema, data, loader) do
@@ -36,7 +36,7 @@ defmodule Ecto.Schema.Loader do
   @doc """
   Loads data coming from the user/embeds into struct and types.
 
-  Assumes data does not all belongs to schema/struct
+  Assumes data does not all belong to schema/struct
   and that it may also require source-based renaming.
   """
   def unsafe_load(struct, types, map, loader) when is_map(map) do
@@ -74,7 +74,7 @@ defmodule Ecto.Schema.Loader do
 
       :error ->
         raise ArgumentError,
-              "cannot load `#{inspect(value)}` as type #{inspect(type)} " <>
+              "cannot load `#{inspect(value)}` as type #{Ecto.Type.format(type)} " <>
                 "for field `#{field}`#{error_data(struct)}"
     end
   end
@@ -91,14 +91,14 @@ defmodule Ecto.Schema.Loader do
   Dumps the given data.
   """
   def safe_dump(struct, types, dumper) do
-    Enum.reduce(types, %{}, fn {field, {source, type}}, acc ->
+    Enum.reduce(types, %{}, fn {field, {source, type, _writable}}, acc ->
       value = Map.get(struct, field)
 
       case dumper.(type, value) do
         {:ok, value} ->
           Map.put(acc, source, value)
         :error ->
-          raise ArgumentError, "cannot dump `#{inspect value}` as type #{inspect type} " <>
+          raise ArgumentError, "cannot dump `#{inspect value}` as type #{Ecto.Type.format(type)} " <>
                                "for field `#{field}` in schema #{inspect struct.__struct__}"
       end
     end)

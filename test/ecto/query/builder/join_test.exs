@@ -21,12 +21,52 @@ defmodule Ecto.Query.Builder.JoinTest do
     assert %{joins: [_]} = join("posts", :inner, [p], c in join_macro(^left, ^right), on: true)
   end
 
-  test "accepts keywords on :on" do
-    assert %{joins: [join]} =
-            join("posts", :inner, [p], c in "comments", on: [post_id: p.id, public: true])
-    assert Macro.to_string(join.on.expr) ==
-           "&1.post_id() == &0.id() and &1.public() == %Ecto.Query.Tagged{tag: nil, type: {1, :public}, value: true}"
-    assert join.on.params == []
+  test "values list source" do
+    # Valid input
+    values = [%{num: 1, text: "one"}, %{num: 2, text: "two"}]
+    types = %{num: :integer, text: :string}
+    query = from p in "posts", join: v in values(values, types), on: true
+
+    [join] = query.joins
+    types_kw = Enum.map(types, & &1)
+    assert {:values, [], [types_kw, length(values)]} == join.source
+
+    # Missing type
+    msg = "values/2 must declare the type for every field. The type was not given for field `text`"
+
+    assert_raise ArgumentError, msg, fn ->
+      values = [%{num: 1, text: "one"}, %{num: 2, text: "two"}]
+      types = %{num: :integer}
+      from p in "posts", join: v in values(values, types), on: true
+    end
+
+    # Missing field
+    msg = "each member of a values list must have the same fields. Missing field `text` in %{num: 2}"
+
+    assert_raise ArgumentError, msg, fn ->
+      values = [%{num: 1, text: "one"}, %{num: 2}]
+      types = %{num: :integer, text: :string}
+      from p in "posts", join: v in values(values, types), on: true
+    end
+  end
+
+  # TODO: AST is represented as string differently on versions pre 1.13
+  if Version.match?(System.version(), ">= 1.13.0-dev") do
+    test "accepts keywords on :on" do
+      assert %{joins: [join]} =
+              join("posts", :inner, [p], c in "comments", on: [post_id: p.id, public: true])
+      assert Macro.to_string(join.on.expr) ==
+            "&1.post_id() == &0.id() and\n  &1.public() == %Ecto.Query.Tagged{tag: nil, type: {1, :public}, value: true}"
+      assert join.on.params == []
+    end
+  else
+    test "accepts keywords on :on" do
+      assert %{joins: [join]} =
+              join("posts", :inner, [p], c in "comments", on: [post_id: p.id, public: true])
+      assert Macro.to_string(join.on.expr) ==
+            "&1.post_id() == &0.id() and &1.public() == %Ecto.Query.Tagged{tag: nil, type: {1, :public}, value: true}"
+      assert join.on.params == []
+    end
   end
 
   test "accepts queries on interpolation" do
@@ -79,12 +119,12 @@ defmodule Ecto.Query.Builder.JoinTest do
     join("posts", :left, [p], c in subquery(subquery), on: true)
     join("posts", :left, [p], c in subquery(subquery, prefix: "sample"), on: true)
   end
-  
+
   test "`as` accepts literal atoms and interpolated values, but not other literals" do
     name = :comments
     join("posts", :left, [p], c in assoc(p, :comments), as: :comments)
     join("posts", :left, [p], c in assoc(p, :comments), as: ^name)
-    assert_raise Ecto.Query.CompileError, "`as` must be a compile time atom or an interpolated value using ^, got: 10", fn -> 
+    assert_raise Ecto.Query.CompileError, "`as` must be a compile time atom or an interpolated value using ^, got: 10", fn ->
       quote_and_eval(join("posts", :left, [p], c in assoc(p, :comments), as: 10))
     end
   end

@@ -28,6 +28,7 @@ defmodule Ecto.Integration.Post do
   """
   use Ecto.Integration.Schema
   import Ecto.Changeset
+  import Ecto.Query, only: [dynamic: 2]
 
   schema "posts" do
     field :counter, :id # Same as integer
@@ -57,6 +58,8 @@ defmodule Ecto.Integration.Post do
     many_to_many :users, Ecto.Integration.User,
       join_through: "posts_users", on_delete: :delete_all, on_replace: :delete
     many_to_many :ordered_users, Ecto.Integration.User, join_through: "posts_users", preload_order: [desc: :name]
+    many_to_many :ordered_users_by_join_table, Ecto.Integration.User,
+      join_through: "posts_users", preload_order: {__MODULE__, :preload_order, []}
     many_to_many :unique_users, Ecto.Integration.User,
       join_through: "posts_users", unique: true
     many_to_many :constraint_users, Ecto.Integration.User,
@@ -65,6 +68,10 @@ defmodule Ecto.Integration.Post do
     has_many :comments_authors_permalinks, through: [:comments_authors, :permalink]
     has_one :post_user_composite_pk, Ecto.Integration.PostUserCompositePk
     timestamps()
+  end
+
+  def preload_order() do
+    [desc: dynamic([assoc, join], join.user_id)]
   end
 
   def changeset(schema, params) do
@@ -90,6 +97,7 @@ defmodule Ecto.Integration.Comment do
     belongs_to :post, Ecto.Integration.Post
     belongs_to :author, Ecto.Integration.User
     has_one :post_permalink, through: [:post, :permalink]
+    has_one :author_permalink, through: [:author, :permalink]
   end
 
   def changeset(schema, params) do
@@ -116,6 +124,7 @@ defmodule Ecto.Integration.Permalink do
     belongs_to :update_post, Ecto.Integration.Post, on_replace: :update, foreign_key: :post_id, define_field: false
     belongs_to :user, Ecto.Integration.User
     has_many :post_comments_authors, through: [:post, :comments_authors]
+    has_many :user_posts, through: [:user, :posts]
   end
 
   def changeset(schema, params) do
@@ -264,12 +273,15 @@ defmodule Ecto.Integration.Order do
 
     * Text columns
     * Embedding one schema
+    * Preloading items inside embeds_many
+    * Preloading items inside embeds_one
+    * Field source with json_extract_path
 
   """
   use Ecto.Integration.Schema
 
   schema "orders" do
-    field :meta, :map
+    field :metadata, :map, source: :meta
     embeds_one :item, Ecto.Integration.Item
     embeds_many :items, Ecto.Integration.Item
     belongs_to :permalink, Ecto.Integration.Permalink
@@ -373,5 +385,39 @@ defmodule Ecto.Integration.ArrayLogging do
   schema "array_loggings" do
     field :uuids, {:array, Ecto.Integration.TestRepo.uuid()}
     timestamps()
+  end
+end
+
+defmodule Ecto.Integration.Bitstring do
+  @moduledoc """
+  This module is used to test:
+
+    * Bitstring type
+
+  """
+  use Ecto.Integration.Schema
+
+  schema "bitstrings" do
+    field :bs,  :bitstring
+    field :bs_with_default, :bitstring
+    field :bs_with_size, :bitstring
+  end
+end
+
+if Code.ensure_loaded?(Duration) do
+  defmodule Ecto.Integration.Duration do
+    @moduledoc """
+    This module is used to test:
+      * Duration type
+    """
+    use Ecto.Integration.Schema
+
+    schema "durations" do
+      field :dur, :duration
+      field :dur_with_fields, :duration
+      field :dur_with_precision, :duration
+      field :dur_with_fields_and_precision, :duration
+      field :dur_with_default, :duration
+    end
   end
 end

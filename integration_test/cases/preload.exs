@@ -10,6 +10,7 @@ defmodule Ecto.Integration.PreloadTest do
   alias Ecto.Integration.Permalink
   alias Ecto.Integration.User
   alias Ecto.Integration.Custom
+  alias Ecto.Integration.Order
 
   test "preload with parameter from select_merge" do
     p1 = TestRepo.insert!(%Post{title: "p1"})
@@ -211,6 +212,11 @@ defmodule Ecto.Integration.PreloadTest do
     assert c.post_permalink == nil
   end
 
+  test "preload through with nil struct" do
+    %Comment{} = c = TestRepo.insert!(%Comment{})
+    [%Comment{}, nil] = TestRepo.preload([c, nil], [:post, :post_permalink])
+  end
+
   test "preload has_many through-through" do
     %Post{id: pid1} = TestRepo.insert!(%Post{})
     %Post{id: pid2} = TestRepo.insert!(%Post{})
@@ -323,7 +329,7 @@ defmodule Ecto.Integration.PreloadTest do
 
   ## With queries
 
-  test "preload with function" do
+  test "preload with 1-arity function" do
     p1 = TestRepo.insert!(%Post{title: "1"})
     p2 = TestRepo.insert!(%Post{title: "2"})
     p3 = TestRepo.insert!(%Post{title: "3"})
@@ -339,6 +345,23 @@ defmodule Ecto.Integration.PreloadTest do
     assert [%Comment{id: ^cid1}, %Comment{id: ^cid2}] = pe1.comments
     assert [%Comment{id: ^cid3}, %Comment{id: ^cid4}] = pe2.comments
     assert [] = pe3.comments
+  end
+
+  test "preload with 2-arity function" do
+    p = TestRepo.insert!(%Post{title: "1"})
+    c1 = TestRepo.insert!(%Comment{post_id: p.id})
+    c2 = TestRepo.insert!(%Comment{post_id: p.id})
+
+    # making a simple preloader so that it works across all adapters
+    preloader = fn parent_ids, assoc ->
+      %{related_key: related_key, queryable: queryable} = assoc
+
+      from(q in queryable, where: field(q, ^related_key) in ^parent_ids, order_by: q.id)
+      |> TestRepo.all()
+    end
+
+    assert p = TestRepo.preload(p, comments: preloader)
+    assert [^c1, ^c2] = p.comments
   end
 
   test "preload many_to_many with function" do
@@ -363,6 +386,7 @@ defmodule Ecto.Integration.PreloadTest do
       TestRepo.all(
         from u in User,
              join: pu in "posts_users",
+             on: true,
              where: pu.post_id in ^post_ids and pu.user_id == u.id,
              order_by: u.id,
              select: map(u, [:id])
@@ -377,6 +401,7 @@ defmodule Ecto.Integration.PreloadTest do
       TestRepo.all(
         from u in User,
              join: pu in "posts_users",
+             on: true,
              where: pu.post_id in ^post_ids and pu.user_id == u.id,
              order_by: u.id,
              select: {pu.post_id, map(u, [:id])}
@@ -461,6 +486,19 @@ defmodule Ecto.Integration.PreloadTest do
     np1 = TestRepo.preload(p1, comments_authors: from(u in User, order_by: u.name, select: %{id: u.id}))
     assert np1.comments_authors ==
            [%{id: u1.id}, %{id: u2.id}, %{id: u3.id}, %{id: u4.id}]
+  end
+
+  test "preload into a subquery source" do
+    %{id: p_id} = TestRepo.insert!(%Post{})
+    %{id: c_id} = TestRepo.insert!(%Comment{post_id: p_id})
+
+    q =
+      from c in subquery(from c in Comment),
+        join: p in Post,
+        on: c.post_id == p.id,
+        preload: [post: p]
+
+    assert [%Comment{id: ^c_id, post: %Post{id: ^p_id}}] = TestRepo.all(q)
   end
 
   ## With take
@@ -565,6 +603,16 @@ defmodule Ecto.Integration.PreloadTest do
 
     # desc
     assert [%{name: "foo"}, %{name: "bar"}] = post.ordered_users
+  end
+
+  test "custom preload_order with mfa" do
+    post1 = TestRepo.insert!(%Post{users: [%User{name: "bar"}, %User{name: "foo"}], title: "1"})
+    post2 = TestRepo.insert!(%Post{users: [%User{name: "baz"}, %User{name: "foz"}], title: "2"})
+
+    [post1, post2] = TestRepo.preload([post1, post2], [:ordered_users_by_join_table], log: :error)
+
+    assert [%{name: "foo"}, %{name: "bar"}] = post1.ordered_users_by_join_table
+    assert [%{name: "foz"}, %{name: "baz"}] = post2.ordered_users_by_join_table
   end
 
   ## Others
@@ -706,6 +754,65 @@ defmodule Ecto.Integration.PreloadTest do
     # Now we preload it
     item = TestRepo.preload(item, :user)
     assert %User{id: ^uid1} = item.user
+  end
+
+  describe "preload associations from nested embeds" do
+    setup do
+      %User{id: uid1} = TestRepo.insert!(%User{name: "1"})
+      %User{id: uid2} = TestRepo.insert!(%User{name: "2"})
+      %User{id: uid3} = TestRepo.insert!(%User{name: "3"})
+      item1 = %Item{id: 1, user_id: uid1}
+      item2 = %Item{id: 2, user_id: uid2}
+      item3 = %Item{id: 3, user_id: uid3}
+      order1 = %Order{items: [item1, item3, item2], item: item1}
+      order2 = %Order{items: [], item: nil}
+      order3 = %Order{items: nil, item: nil}
+      order4 = %Order{items: [item1, item2], item: item2}
+
+      [orders: [order1, order2, order3, order4]]
+    end
+
+    test "cannot preload embed without its associations", context do
+      assert_raise ArgumentError, ~r/cannot preload embedded field/, fn ->
+        TestRepo.preload(context.orders, :item)
+      end
+    end
+
+    test "embeds_one", context do
+      [nil | preloaded_orders] = [nil | context.orders] |> TestRepo.preload(item: :user)
+
+      expected_item_user =
+        Enum.map(context.orders, fn
+          %{item: nil} -> {nil, nil}
+          %{item: item} -> {item.id, item.user_id}
+        end)
+
+      actual_item_user =
+        Enum.map(preloaded_orders, fn
+          %{item: nil} -> {nil, nil}
+          %{item: item} -> {item.id, item.user.id}
+        end)
+
+      assert expected_item_user == actual_item_user
+    end
+
+    test "embeds_many", context do
+      [nil | preloaded_orders] = [nil | context.orders] |> TestRepo.preload(items: :user)
+
+      expected_items_user =
+        Enum.map(context.orders, fn
+          %{items: nil} -> {nil, nil}
+          %{items: items} -> Enum.map(items, & {&1.id, &1.user_id})
+        end)
+
+      actual_items_user =
+        Enum.map(preloaded_orders, fn
+          %{items: nil} -> {nil, nil}
+          %{items: items} -> Enum.map(items, & {&1.id, &1.user.id})
+        end)
+
+      assert expected_items_user == actual_items_user
+    end
   end
 
   defp sort_by_id(values) do

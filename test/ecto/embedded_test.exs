@@ -34,6 +34,15 @@ defmodule Ecto.EmbeddedTest do
     end
   end
 
+  defmodule Settings do
+    use Ecto.Schema
+
+    embedded_schema do
+      field :dark_mode, :boolean, default: false
+      embeds_one :default_post, Post, defaults_to_struct: true
+    end
+  end
+
   test "__schema__" do
     assert Author.__schema__(:embeds) ==
       [:profile, :post, :posts]
@@ -63,6 +72,12 @@ defmodule Ecto.EmbeddedTest do
     assert %UUIDSchema{uuid: ^uuid, authors: [%Author{}]} =
              Ecto.embedded_load(UUIDSchema, %{"uuid" => uuid, "authors" => [%{}]}, :json)
 
+    assert %Settings{dark_mode: false, default_post: %Post{}} =
+             Ecto.embedded_load(Settings, %{}, :json)
+
+    assert %Settings{dark_mode: false, default_post: nil} =
+             Ecto.embedded_load(Settings, %{"default_post" => nil}, :json)
+
     assert_raise ArgumentError,
                  ~s[cannot load `"ABC"` as type Ecto.UUID for field `uuid` in schema Ecto.EmbeddedTest.UUIDSchema],
                  fn ->
@@ -85,5 +100,11 @@ defmodule Ecto.EmbeddedTest do
     assert [author1 | _] = dumped.authors
     assert not Map.has_key?(author1, :__struct__)
     assert not Map.has_key?(author1, :__meta__)
+  end
+
+  test "embedded schemas are not queryable" do
+    assert_raise Protocol.UndefinedError,
+                   ~r"the given module is an embedded schema",
+                   fn -> Ecto.Queryable.to_query(Post) end
   end
 end

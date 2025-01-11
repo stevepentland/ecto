@@ -14,6 +14,7 @@ defmodule Ecto.Changeset.HasAssocTest do
 
     schema "posts" do
       field :title, :string
+      field :position, :integer
       belongs_to :author, Author
     end
 
@@ -21,6 +22,13 @@ defmodule Ecto.Changeset.HasAssocTest do
       Changeset.cast(schema, params, ~w(title author_id)a)
       |> Changeset.validate_required(:title)
       |> Changeset.validate_length(:title, min: 3)
+    end
+
+    def changeset_with_position(schema, params, position) do
+      Changeset.cast(schema, params, ~w(title author_id)a)
+      |> Changeset.validate_required(:title)
+      |> Changeset.validate_length(:title, min: 3)
+      |> Changeset.put_change(:position, position)
     end
 
     def set_action(schema, params) do
@@ -73,7 +81,7 @@ defmodule Ecto.Changeset.HasAssocTest do
     def optional_changeset(schema, params) do
       Changeset.cast(schema, params, ~w(name)a)
     end
-    
+
     def failing_changeset(schema, params, error_string) do
       Changeset.cast(schema, params, ~w(name)a)
       |> Changeset.add_error(:name, error_string)
@@ -260,13 +268,6 @@ defmodule Ecto.Changeset.HasAssocTest do
     assert profile.action  == :insert
     assert profile.valid?
     assert changeset.valid?
-  end
-  
-  test "cast has_one with custom changeset specified with mfa" do
-    changeset = cast(%Author{}, %{"profile" => %{}}, :profile, with: {Profile, :failing_changeset, ["test"]})
-
-    assert changeset.changes.profile.errors == [name: {"test", []}]
-    refute changeset.valid?
   end
 
   test "cast has_one keeps appropriate action from changeset" do
@@ -468,6 +469,26 @@ defmodule Ecto.Changeset.HasAssocTest do
     assert third.valid?
 
     refute changeset.valid?
+  end
+
+  test "cast has_many with sort_param, drop param and arity-3 with" do
+    posts = %{1 => %{"title" => "one"}, 2 => %{"title" => "two"}, 3 => %{"title" => "three"}}
+    opts = [sort_param: :sort, drop_param: :drop, with: &Post.changeset_with_position/3]
+
+    changeset = cast(%Author{}, %{"posts" => posts}, :posts, opts)
+    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ~w(one two three)
+
+    changeset = cast(%Author{}, %{"posts" => posts, "drop" => [2]}, :posts, opts)
+    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ["one", "three"]
+    assert Enum.map(changeset.changes.posts, & &1.changes[:position]) == [0, 1]
+
+    changeset = cast(%Author{}, %{"posts" => posts, "sort" => [2, 3, 1]}, :posts, opts)
+    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ~w(two three one)
+    assert Enum.map(changeset.changes.posts, & &1.changes[:position]) == [0, 1, 2]
+
+    changeset = cast(%Author{}, %{posts: posts, sort: [1, "new"], drop: [2, "new"]}, :posts, opts)
+    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ["one", "three"]
+    assert Enum.map(changeset.changes.posts, & &1.changes[:position]) == [0, 1]
   end
 
   test "cast has_many with invalid operation" do
@@ -921,7 +942,7 @@ defmodule Ecto.Changeset.HasAssocTest do
     assert capture_io(:stderr, fn ->
       changeset = Changeset.validate_required(base_changeset, :posts)
       assert changeset.valid?
-    end) =~ ~r/attempting to validate has_many association :posts/
+    end) =~ ~r/attempting to determine the presence of has_many association :posts/
   end
 
   test "put_assoc/4 with has_one" do
@@ -1084,7 +1105,7 @@ defmodule Ecto.Changeset.HasAssocTest do
     assert changeset.changes.profile.changes == %{name: "jose"}
   end
 
-  test "get_field/3, fetch_field/2 with has one" do
+  test "get_field/3, fetch_field/2, get_assoc/3 with has one" do
     profile_changeset = Changeset.change(%Profile{}, name: "michal")
     profile = Changeset.apply_changes(profile_changeset)
 
@@ -1094,14 +1115,20 @@ defmodule Ecto.Changeset.HasAssocTest do
       |> Changeset.put_assoc(:profile, profile_changeset)
     assert Changeset.get_field(changeset, :profile) == profile
     assert Changeset.fetch_field(changeset, :profile) == {:changes, profile}
+    assert Changeset.get_assoc(changeset, :profile, :changeset) == %{profile_changeset | action: :insert}
+    assert Changeset.get_assoc(changeset, :profile, :struct) == profile
 
     changeset = Changeset.change(%Author{profile: profile})
     assert Changeset.get_field(changeset, :profile) == profile
     assert Changeset.fetch_field(changeset, :profile) == {:data, profile}
+    assert Changeset.get_assoc(changeset, :profile, :changeset) == Changeset.change(profile)
+    assert Changeset.get_assoc(changeset, :profile, :struct) == profile
 
     changeset = Changeset.change(%Author{})
     assert Changeset.get_field(changeset, :profile) == nil
     assert Changeset.fetch_field(changeset, :profile) == {:data, nil}
+    assert Changeset.get_assoc(changeset, :profile, :changeset) == nil
+    assert Changeset.get_assoc(changeset, :profile, :struct) == nil
 
     schema = put_in(%Author{}.__meta__.state, :loaded)
     changeset = Changeset.change(schema)
@@ -1111,9 +1138,12 @@ defmodule Ecto.Changeset.HasAssocTest do
     assert_raise RuntimeError, ~r"Please preload", fn ->
       Changeset.fetch_field(changeset, :profile)
     end
+    assert_raise RuntimeError, ~r"Please preload", fn ->
+      Changeset.get_assoc(changeset, :profile, :changeset)
+    end
   end
 
-  test "get_field/3, fetch_field/2 with has many" do
+  test "get_field/3, fetch_field/2, get_assoc/3 with has many" do
     post = %Post{id: 1}
 
     changeset =
@@ -1121,6 +1151,8 @@ defmodule Ecto.Changeset.HasAssocTest do
       |> Changeset.change
     assert Changeset.get_field(changeset, :posts) == [post]
     assert Changeset.fetch_field(changeset, :posts) == {:data, [post]}
+    assert Changeset.get_assoc(changeset, :posts, :changeset) == [Changeset.change(post)]
+    assert Changeset.get_assoc(changeset, :posts, :struct) == [post]
 
     post_changeset = Changeset.change(post, title: "updated")
     changeset =
@@ -1129,6 +1161,8 @@ defmodule Ecto.Changeset.HasAssocTest do
       |> Changeset.put_assoc(:posts, [post_changeset])
     assert Changeset.get_field(changeset, :posts) == [%{post | title: "updated"}]
     assert Changeset.fetch_field(changeset, :posts) == {:changes, [%{post | title: "updated"}]}
+    assert Changeset.get_assoc(changeset, :posts, :changeset) == [%{post_changeset | action: :update}]
+    assert Changeset.get_assoc(changeset, :posts, :struct) == [%{post | title: "updated"}]
 
     post_changeset = %{Changeset.change(post) | action: :delete}
     changeset =
@@ -1137,10 +1171,14 @@ defmodule Ecto.Changeset.HasAssocTest do
       |> Changeset.put_assoc(:posts, [post_changeset])
     assert Changeset.get_field(changeset, :posts) == []
     assert Changeset.fetch_field(changeset, :posts) == {:changes, []}
+    assert Changeset.get_assoc(changeset, :posts, :changeset) == [%{post_changeset | action: :delete}]
+    assert Changeset.get_assoc(changeset, :posts, :struct) == []
 
     changeset = Changeset.change(%Author{})
     assert Changeset.get_field(changeset, :posts) == []
     assert Changeset.fetch_field(changeset, :posts) == {:data, []}
+    assert Changeset.get_assoc(changeset, :posts, :changeset) == []
+    assert Changeset.get_assoc(changeset, :posts, :struct) == []
 
     schema = put_in(%Author{}.__meta__.state, :loaded)
     changeset = Changeset.change(schema)
@@ -1149,6 +1187,9 @@ defmodule Ecto.Changeset.HasAssocTest do
     end
     assert_raise RuntimeError, ~r"Please preload", fn ->
       Changeset.fetch_field(changeset, :posts)
+    end
+    assert_raise RuntimeError, ~r"Please preload", fn ->
+      Changeset.get_assoc(changeset, :posts, :changeset)
     end
   end
 

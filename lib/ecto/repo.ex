@@ -28,7 +28,7 @@ defmodule Ecto.Repo do
   to the adapter. For this particular example, you can check
   [`Ecto.Adapters.Postgres`](https://hexdocs.pm/ecto_sql/Ecto.Adapters.Postgres.html)
   for more information. In spite of this, the following configuration values
-  are shared across all adapters:
+  are common across all adapters:
 
     * `:name`- The name of the Repo supervisor process
 
@@ -40,17 +40,25 @@ defmodule Ecto.Repo do
       for more information
 
     * `:log` - the log level used when logging the query with Elixir's
-      Logger. If false, disables logging for that repository.
-      Defaults to `:debug`
+      Logger. Can be any of `Logger.level/0` values or `false`. If false,
+      disables logging for that repository. Defaults to `:debug`
 
     * `:pool_size` - the size of the pool used by the connection module.
       Defaults to `10`
 
+    * `:pool_count` - the number of pools to run concurrently,
+      increase this option when the pool itself may be under contention.
+      When running multiple pools, queries are randomly routed to different
+      pools, without taking into account how many connections are available
+      in each. So in some circumstances, you may be routed to a fully busy
+      pool while others have connections available. The overall number of
+      connections used will be `pool_size * pool_count`. Defaults to `1`
+
     * `:telemetry_prefix` - we recommend adapters to publish events
-      using the `Telemetry` library. By default, the telemetry prefix
+      using the [Telemetry](`:telemetry`) library. By default, the telemetry prefix
       is based on the module name, so if your module is called
       `MyApp.Repo`, the prefix will be `[:my_app, :repo]`. See the
-      "Telemetry Events" section to see which events we recommend
+      ["Telemetry Events"](#module-telemetry-events) section to see which events we recommend
       adapters to publish. Note that if you have multiple databases, you
       should keep the `:telemetry_prefix` consistent for each repo and
       use the `:repo` property in the event metadata for distinguishing
@@ -67,8 +75,10 @@ defmodule Ecto.Repo do
       config :my_app, Repo,
         url: "ecto://postgres:postgres@localhost/ecto_simple"
 
-  The schema can be of any value. The path represents the database name
-  while options are simply merged in.
+  The schema can be of any value and the path represents the database name.
+  The URL will be used generate the relevant Repo configuration values, such
+  as `:database`, `:username`, `:password`, `:hostname` and `:port`. These
+  values take precedence over those already specified in the Repo's configuration.
 
   URL can include query parameters to override shared and adapter-specific
   options, like `ssl`, `timeout` and `pool_size`. The following example
@@ -77,14 +87,6 @@ defmodule Ecto.Repo do
       config :my_app, Repo,
         url: "ecto://postgres:postgres@localhost/ecto_simple?ssl=true&pool_size=10"
 
-  In case the URL needs to be dynamically configured, for example by
-  reading a system environment variable, such can be done via the
-  `c:init/2` repository callback:
-
-      def init(_type, config) do
-        {:ok, Keyword.put(config, :url, System.get_env("DATABASE_URL"))}
-      end
-
   ## Shared options
 
   Almost all of the repository functions outlined in this module accept the following
@@ -92,11 +94,17 @@ defmodule Ecto.Repo do
 
     * `:timeout` - The time in milliseconds (as an integer) to wait for the query call to
       finish. `:infinity` will wait indefinitely (default: `15_000`)
-    * `:log` - When false, does not log the query
+    * `:log` - Can be any of the `Logger.level/0` values or `false`. If `false`,
+      logging is disabled. Defaults to the configured Repo logger level
     * `:telemetry_event` - The telemetry event name to dispatch the event under.
       See the next section for more information
     * `:telemetry_options` - Extra options to attach to telemetry event name.
       See the next section for more information
+
+  ## Adapter-Specific Errors
+
+  Many of the functions in this module may raise adapter-specific errors, such as `PostgrexError`.
+  This can happen, for example, when the underlying database cannot execute the specified query.
 
   ## Telemetry events
 
@@ -141,7 +149,7 @@ defmodule Ecto.Repo do
   This event should be invoked on every query sent to the adapter, including
   queries that are related to the transaction management.
 
-  The `:measurements` map will include the following, all given in the
+  The `:measurements` map may include the following, all given in the
   `:native` time unit:
 
     * `:idle_time` - the time the connection spent waiting before being checked out for the query
@@ -161,7 +169,8 @@ defmodule Ecto.Repo do
       databases, it would be `:ecto_sql_query`
     * `:repo` - the Ecto repository
     * `:result` - the query result
-    * `:params` - the query parameters
+    * `:params` - the dumped query parameters (formatted for database drivers like Postgrex)
+    * `:cast_params` - the casted query parameters (normalized before dumping)
     * `:query` - the query sent to the database as a string
     * `:source` - the source the query was made on (may be `nil`)
     * `:stacktrace` - the stacktrace information, if enabled, or `nil`
@@ -208,7 +217,7 @@ defmodule Ecto.Repo do
       @aggregates [:count, :avg, :max, :min, :sum]
 
       def config do
-        {:ok, config} = Ecto.Repo.Supervisor.runtime_config(:runtime, __MODULE__, @otp_app, [])
+        {:ok, config} = Ecto.Repo.Supervisor.init_config(:runtime, __MODULE__, @otp_app, [])
         config
       end
 
@@ -246,7 +255,7 @@ defmodule Ecto.Repo do
         adapter.checked_out?(meta)
       end
 
-      @compile {:inline, get_dynamic_repo: 0, prepare_opts: 2}
+      @compile {:inline, get_dynamic_repo: 0}
 
       def get_dynamic_repo() do
         Process.get({__MODULE__, :dynamic_repo}, @default_dynamic_repo)
@@ -259,7 +268,9 @@ defmodule Ecto.Repo do
       def default_options(_operation), do: []
       defoverridable default_options: 1
 
-      defp prepare_opts(operation_name, opts) do
+      defp prepare_opts(operation_name, []), do: default_options(operation_name)
+
+      defp prepare_opts(operation_name, [{key, _} | _rest] = opts) when is_atom(key) do
         operation_name
         |> default_options()
         |> Keyword.merge(opts)
@@ -270,7 +281,13 @@ defmodule Ecto.Repo do
       if Ecto.Adapter.Transaction in behaviours do
         def transaction(fun_or_multi, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Transaction.transaction(__MODULE__, repo, fun_or_multi, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:transaction, opts)))
+
+          Ecto.Repo.Transaction.transaction(
+            __MODULE__,
+            repo,
+            fun_or_multi,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:transaction, opts))
+          )
         end
 
         def in_transaction? do
@@ -288,47 +305,102 @@ defmodule Ecto.Repo do
       if Ecto.Adapter.Schema in behaviours and not @read_only do
         def insert(struct, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Schema.insert(__MODULE__, repo, struct, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:insert, opts)))
+
+          Ecto.Repo.Schema.insert(
+            __MODULE__,
+            repo,
+            struct,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:insert, opts))
+          )
         end
 
         def update(struct, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Schema.update(__MODULE__, get_dynamic_repo(), struct, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:update, opts)))
+
+          Ecto.Repo.Schema.update(
+            __MODULE__,
+            repo,
+            struct,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:update, opts))
+          )
         end
 
         def insert_or_update(changeset, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Schema.insert_or_update(__MODULE__, get_dynamic_repo(), changeset, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:insert_or_update, opts)))
+
+          Ecto.Repo.Schema.insert_or_update(
+            __MODULE__,
+            repo,
+            changeset,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:insert_or_update, opts))
+          )
         end
 
         def delete(struct, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Schema.delete(__MODULE__, get_dynamic_repo(), struct, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:delete, opts)))
+
+          Ecto.Repo.Schema.delete(
+            __MODULE__,
+            repo,
+            struct,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:delete, opts))
+          )
         end
 
         def insert!(struct, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Schema.insert!(__MODULE__, get_dynamic_repo(), struct, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:insert, opts)))
+
+          Ecto.Repo.Schema.insert!(
+            __MODULE__,
+            repo,
+            struct,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:insert, opts))
+          )
         end
 
         def update!(struct, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Schema.update!(__MODULE__, get_dynamic_repo(), struct, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:update, opts)))
+
+          Ecto.Repo.Schema.update!(
+            __MODULE__,
+            repo,
+            struct,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:update, opts))
+          )
         end
 
         def insert_or_update!(changeset, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Schema.insert_or_update!(__MODULE__, get_dynamic_repo(), changeset, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:insert_or_update, opts)))
+
+          Ecto.Repo.Schema.insert_or_update!(
+            __MODULE__,
+            repo,
+            changeset,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:insert_or_update, opts))
+          )
         end
 
         def delete!(struct, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Schema.delete!(__MODULE__, get_dynamic_repo(), struct, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:delete, opts)))
+
+          Ecto.Repo.Schema.delete!(
+            __MODULE__,
+            repo,
+            struct,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:delete, opts))
+          )
         end
 
         def insert_all(schema_or_source, entries, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Schema.insert_all(__MODULE__, get_dynamic_repo(), schema_or_source, entries, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:insert_all, opts)))
+
+          Ecto.Repo.Schema.insert_all(
+            __MODULE__,
+            repo,
+            schema_or_source,
+            entries,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:insert_all, opts))
+          )
         end
       end
 
@@ -338,63 +410,128 @@ defmodule Ecto.Repo do
         if not @read_only do
           def update_all(queryable, updates, opts \\ []) do
             repo = get_dynamic_repo()
-            Ecto.Repo.Queryable.update_all(get_dynamic_repo(), queryable, updates, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:update_all, opts)))
+
+            Ecto.Repo.Queryable.update_all(
+              repo,
+              queryable,
+              updates,
+              Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:update_all, opts))
+            )
           end
 
           def delete_all(queryable, opts \\ []) do
             repo = get_dynamic_repo()
-            Ecto.Repo.Queryable.delete_all(get_dynamic_repo(), queryable, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:delete_all, opts)))
+
+            Ecto.Repo.Queryable.delete_all(
+              repo,
+              queryable,
+              Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:delete_all, opts))
+            )
           end
         end
 
         def all(queryable, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Queryable.all(get_dynamic_repo(), queryable, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts)))
+
+          Ecto.Repo.Queryable.all(
+            repo,
+            queryable,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts))
+          )
         end
 
         def stream(queryable, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Queryable.stream(get_dynamic_repo(), queryable, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:stream, opts)))
+
+          Ecto.Repo.Queryable.stream(
+            repo,
+            queryable,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:stream, opts))
+          )
         end
 
         def get(queryable, id, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Queryable.get(get_dynamic_repo(), queryable, id, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts)))
+
+          Ecto.Repo.Queryable.get(
+            repo,
+            queryable,
+            id,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts))
+          )
         end
 
         def get!(queryable, id, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Queryable.get!(get_dynamic_repo(), queryable, id, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts)))
+
+          Ecto.Repo.Queryable.get!(
+            repo,
+            queryable,
+            id,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts))
+          )
         end
 
         def get_by(queryable, clauses, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Queryable.get_by(get_dynamic_repo(), queryable, clauses, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts)))
+
+          Ecto.Repo.Queryable.get_by(
+            repo,
+            queryable,
+            clauses,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts))
+          )
         end
 
         def get_by!(queryable, clauses, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Queryable.get_by!(get_dynamic_repo(), queryable, clauses, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts)))
+
+          Ecto.Repo.Queryable.get_by!(
+            repo,
+            queryable,
+            clauses,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts))
+          )
         end
 
         def reload(queryable, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Queryable.reload(get_dynamic_repo(), queryable, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:reload, opts)))
+
+          Ecto.Repo.Queryable.reload(
+            repo,
+            queryable,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:reload, opts))
+          )
         end
 
         def reload!(queryable, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Queryable.reload!(get_dynamic_repo(), queryable, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:reload, opts)))
+
+          Ecto.Repo.Queryable.reload!(
+            repo,
+            queryable,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:reload, opts))
+          )
         end
 
         def one(queryable, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Queryable.one(get_dynamic_repo(), queryable, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts)))
+
+          Ecto.Repo.Queryable.one(
+            repo,
+            queryable,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts))
+          )
         end
 
         def one!(queryable, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Queryable.one!(get_dynamic_repo(), queryable, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts)))
+
+          Ecto.Repo.Queryable.one!(
+            repo,
+            queryable,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts))
+          )
         end
 
         def aggregate(queryable, aggregate, opts \\ [])
@@ -402,29 +539,60 @@ defmodule Ecto.Repo do
         def aggregate(queryable, aggregate, opts)
             when aggregate in [:count] and is_list(opts) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Queryable.aggregate(get_dynamic_repo(), queryable, aggregate, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts)))
+
+          Ecto.Repo.Queryable.aggregate(
+            repo,
+            queryable,
+            aggregate,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts))
+          )
         end
 
         def aggregate(queryable, aggregate, field)
             when aggregate in @aggregates and is_atom(field) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Queryable.aggregate(get_dynamic_repo(), queryable, aggregate, field, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, [])))
+
+          Ecto.Repo.Queryable.aggregate(
+            repo,
+            queryable,
+            aggregate,
+            field,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, []))
+          )
         end
 
         def aggregate(queryable, aggregate, field, opts)
             when aggregate in @aggregates and is_atom(field) and is_list(opts) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Queryable.aggregate(get_dynamic_repo(), queryable, aggregate, field, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts)))
+
+          Ecto.Repo.Queryable.aggregate(
+            repo,
+            queryable,
+            aggregate,
+            field,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts))
+          )
         end
 
         def exists?(queryable, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Queryable.exists?(get_dynamic_repo(), queryable, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts)))
+
+          Ecto.Repo.Queryable.exists?(
+            repo,
+            queryable,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts))
+          )
         end
 
         def preload(struct_or_structs_or_nil, preloads, opts \\ []) do
           repo = get_dynamic_repo()
-          Ecto.Repo.Preloader.preload(struct_or_structs_or_nil, get_dynamic_repo(), preloads, Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:preload, opts)))
+
+          Ecto.Repo.Preloader.preload(
+            struct_or_structs_or_nil,
+            repo,
+            preloads,
+            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:preload, opts))
+          )
         end
 
         def prepare_query(operation, query, opts), do: {query, opts}
@@ -439,6 +607,9 @@ defmodule Ecto.Repo do
 
   @doc """
   A callback executed when the repo starts or when configuration is read.
+
+  This callback is available for backwards compatibility purposes. Most
+  runtime configuration in Elixir today can be done via config/runtime.exs.
 
   The first argument is the context the callback is being invoked. If it
   is called because the Repo supervisor is starting, it will be `:supervisor`.
@@ -458,7 +629,7 @@ defmodule Ecto.Repo do
   @doc """
   Returns the adapter tied to the repository.
   """
-  @doc group: "Runtime API"
+  @doc group: "Config API"
   @callback __adapter__ :: Ecto.Adapter.t()
 
   @doc """
@@ -466,13 +637,13 @@ defmodule Ecto.Repo do
 
   If the `c:init/2` callback is implemented in the repository,
   it will be invoked with the first argument set to `:runtime`.
+  It does not consider the options given on `c:start_link/1`.
   """
-  @doc group: "Runtime API"
+  @doc group: "Config API"
   @callback config() :: Keyword.t()
 
   @doc """
-  Starts any connection pooling or supervision and return `{:ok, pid}`
-  or just `:ok` if nothing needs to be done.
+  Starts the Repo supervision tree.
 
   Returns `{:error, {:already_started, pid}}` if the repo is already
   started or `{:error, term}` in case anything else goes wrong.
@@ -482,7 +653,7 @@ defmodule Ecto.Repo do
   See the configuration in the moduledoc for options shared between adapters,
   for adapter-specific configuration see the adapter's documentation.
   """
-  @doc group: "Runtime API"
+  @doc group: "Process API"
   @callback start_link(opts :: Keyword.t()) ::
               {:ok, pid}
               | {:error, {:already_started, pid}}
@@ -491,7 +662,7 @@ defmodule Ecto.Repo do
   @doc """
   Shuts down the repository.
   """
-  @doc group: "Runtime API"
+  @doc group: "Process API"
   @callback stop(timeout) :: :ok
 
   @doc """
@@ -513,7 +684,7 @@ defmodule Ecto.Repo do
   documentation for more options.
   """
   @doc group: "Transaction API"
-  @callback checkout((() -> result), opts :: Keyword.t()) :: result when result: var
+  @callback checkout((-> result), opts :: Keyword.t()) :: result when result: var
 
   @doc """
   Returns true if a connection has been checked out.
@@ -541,7 +712,7 @@ defmodule Ecto.Repo do
   @doc """
   Loads `data` into a schema or a map.
 
-  The first argument can be a a schema module or a map (of types).
+  The first argument can be a schema module or a map (of types).
   The first argument determines the return value: a struct or a map,
   respectively.
 
@@ -591,7 +762,7 @@ defmodule Ecto.Repo do
 
   See `c:put_dynamic_repo/1` for more information.
   """
-  @doc group: "Runtime API"
+  @doc group: "Process API"
   @callback get_dynamic_repo() :: atom() | pid()
 
   @doc """
@@ -624,14 +795,27 @@ defmodule Ecto.Repo do
   From this moment on, all future queries done by the current process will
   run on `:tenant_foo`.
   """
-  @doc group: "Runtime API"
+  @doc group: "Process API"
   @callback put_dynamic_repo(name_or_pid :: atom() | pid()) :: atom() | pid()
 
   ## Ecto.Adapter.Queryable
 
-  @optional_callbacks get: 3, get!: 3, get_by: 3, get_by!: 3, reload: 2, reload!: 2, aggregate: 3,
-                      aggregate: 4, exists?: 2, one: 2, one!: 2, preload: 3, all: 2, stream: 2,
-                      update_all: 3, delete_all: 2
+  @optional_callbacks get: 3,
+                      get!: 3,
+                      get_by: 3,
+                      get_by!: 3,
+                      reload: 2,
+                      reload!: 2,
+                      aggregate: 3,
+                      aggregate: 4,
+                      exists?: 2,
+                      one: 2,
+                      one!: 2,
+                      preload: 3,
+                      all: 2,
+                      stream: 2,
+                      update_all: 3,
+                      delete_all: 2
 
   @doc """
   Fetches a single struct from the data store where the primary key matches the
@@ -646,7 +830,7 @@ defmodule Ecto.Repo do
       in Postgres or the database in MySQL). This will be applied to all `from`
       and `join`s in the query that did not have a prefix previously given
       either via the `:prefix` option on `join`/`from` or via `@schema_prefix`
-      in the schema. For more information see the "Query Prefix" section of the
+      in the schema. For more information see the ["Query Prefix"](`m:Ecto.Query#module-query-prefix`) section of the
       `Ecto.Query` documentation.
 
   See the ["Shared options"](#module-shared-options) section at the module
@@ -672,7 +856,7 @@ defmodule Ecto.Repo do
       in Postgres or the database in MySQL). This will be applied to all `from`
       and `join`s in the query that did not have a prefix previously given
       either via the `:prefix` option on `join`/`from` or via `@schema_prefix`
-      in the schema. For more information see the "Query Prefix" section of the
+      in the schema. For more information see the ["Query Prefix"](`m:Ecto.Query#module-query-prefix`) section of the
       `Ecto.Query` documentation.
 
   See the ["Shared options"](#module-shared-options) section at the module
@@ -700,7 +884,7 @@ defmodule Ecto.Repo do
       in Postgres or the database in MySQL). This will be applied to all `from`
       and `join`s in the query that did not have a prefix previously given
       either via the `:prefix` option on `join`/`from` or via `@schema_prefix`
-      in the schema. For more information see the "Query Prefix" section of the
+      in the schema. For more information see the ["Query Prefix"](`m:Ecto.Query#module-query-prefix`) section of the
       `Ecto.Query` documentation.
 
   See the ["Shared options"](#module-shared-options) section at the module
@@ -718,7 +902,7 @@ defmodule Ecto.Repo do
               queryable :: Ecto.Queryable.t(),
               clauses :: Keyword.t() | map,
               opts :: Keyword.t()
-            ) :: Ecto.Schema.t()  | term | nil
+            ) :: Ecto.Schema.t() | term | nil
 
   @doc """
   Similar to `c:get_by/3` but raises `Ecto.NoResultsError` if no record was found.
@@ -731,7 +915,7 @@ defmodule Ecto.Repo do
       in Postgres or the database in MySQL). This will be applied to all `from`
       and `join`s in the query that did not have a prefix previously given
       either via the `:prefix` option on `join`/`from` or via `@schema_prefix`
-      in the schema. For more information see the "Query Prefix" section of the
+      in the schema. For more information see the ["Query Prefix"](`m:Ecto.Query#module-query-prefix`) section of the
       `Ecto.Query` documentation.
 
   See the ["Shared options"](#module-shared-options) section at the module
@@ -795,12 +979,15 @@ defmodule Ecto.Repo do
   @doc """
   Calculate the given `aggregate`.
 
-  If the query has a limit, offset, distinct or combination set, it will be
-  automatically wrapped in a subquery in order to return the
-  proper result.
-
   Any preload or select in the query will be ignored in favor of
-  the column being aggregated.
+  the column being aggregated. However, if the query has a limit,
+  offset, distinct or combination set, it will be automatically
+  wrapped in a subquery in order to return the proper result,
+  which requires the select field to follows certain rules:
+  it must return a `source`, a field (such as `source.field`),
+  or a map with atom keys and scalars (integers, floats, and
+  strings) or simple expressions as values. Those rules are shared
+  across all subqueries in Ecto.
 
   The aggregation will fail if any `group_by` field is set.
 
@@ -810,7 +997,7 @@ defmodule Ecto.Repo do
       in Postgres or the database in MySQL). This will be applied to all `from`
       and `join`s in the query that did not have a prefix previously given
       either via the `:prefix` option on `join`/`from` or via `@schema_prefix`
-      in the schema. For more information see the "Query Prefix" section of the
+      in the schema. For more information see the ["Query Prefix"](`m:Ecto.Query#module-query-prefix`) section of the
       `Ecto.Query` documentation.
 
   See the ["Shared options"](#module-shared-options) section at the module
@@ -840,14 +1027,14 @@ defmodule Ecto.Repo do
 
   ## Examples
 
-      # Returns the number of visits per blog post
-      Repo.aggregate(Post, :count, :visits)
+      # Returns the sum of the number of visits for every blog post
+      Repo.aggregate(Post, :sum, :visits)
 
-      # Returns the number of visits per blog post in the "private" schema path
-      # (in Postgres) or database (in MySQL)
-      Repo.aggregate(Post, :count, :visits, prefix: "private")
+      # Returns the sum of the number of visits for every blog post in the
+      # "private" schema path (in Postgres) or database (in MySQL)
+      Repo.aggregate(Post, :sum, :visits, prefix: "private")
 
-      # Returns the average number of visits for the top 10
+      # Returns the average number of visits for the first 10 blog posts
       query = from Post, limit: 10
       Repo.aggregate(query, :avg, :visits)
   """
@@ -860,7 +1047,7 @@ defmodule Ecto.Repo do
             ) :: term | nil
 
   @doc """
-  Checks if there exists an entry that matches the given query.
+  Checks if there exists an entry that matches the given queryable.
 
   Returns a boolean.
 
@@ -870,11 +1057,18 @@ defmodule Ecto.Repo do
       in Postgres or the database in MySQL). This will be applied to all `from`
       and `join`s in the query that did not have a prefix previously given
       either via the `:prefix` option on `join`/`from` or via `@schema_prefix`
-      in the schema. For more information see the "Query Prefix" section of the
+      in the schema. For more information see the ["Query Prefix"](`m:Ecto.Query#module-query-prefix`) section of the
       `Ecto.Query` documentation.
 
   See the ["Shared options"](#module-shared-options) section at the module
   documentation for more options.
+
+  > #### Generated Query {: .info}
+  >
+  > Ecto will take the provided queryable and modify it to reduce its footprint
+  > as much as possible. For example, by forcing `SELECT 1` and `LIMIT 1`. Any
+  > additional filtering must be provided directly on the queryable using expressions
+  > such as `where` and `having`.
 
   ## Examples
 
@@ -883,7 +1077,7 @@ defmodule Ecto.Repo do
 
       # checks if any posts exist in the "private" schema path (in Postgres) or
       # database (in MySQL)
-      Repo.exists?(Post, schema: "private")
+      Repo.exists?(Post, prefix: "private")
 
       # checks if any post with a like count greater than 10 exists
       query = from p in Post, where: p.like_count > 10
@@ -903,7 +1097,7 @@ defmodule Ecto.Repo do
       in Postgres or the database in MySQL). This will be applied to all `from`
       and `join`s in the query that did not have a prefix previously given
       either via the `:prefix` option on `join`/`from` or via `@schema_prefix`
-      in the schema. For more information see the "Query Prefix" section of the
+      in the schema. For more information see the ["Query Prefix"](`m:Ecto.Query#module-query-prefix`) section of the
       `Ecto.Query` documentation.
 
   See the ["Shared options"](#module-shared-options) section at the module
@@ -931,7 +1125,7 @@ defmodule Ecto.Repo do
       in Postgres or the database in MySQL). This will be applied to all `from`
       and `join`s in the query that did not have a prefix previously given
       either via the `:prefix` option on `join`/`from` or via `@schema_prefix`
-      in the schema. For more information see the "Query Prefix" section of the
+      in the schema. For more information see the ["Query Prefix"](`m:Ecto.Query#module-query-prefix`) section of the
       `Ecto.Query` documentation.
 
   See the ["Shared options"](#module-shared-options) section at the module
@@ -949,7 +1143,19 @@ defmodule Ecto.Repo do
   database.
 
   In case the association was already loaded, preload won't attempt
-  to reload it.
+  to reload it. Preload assumes each association has the same nested
+  associations already loaded. If this is not the case, it is
+  possible to lose information. For example:
+
+      comment1 = TestRepo.preload(comment1, [author: [:permalink]])
+      TestRepo.preload([comment1, comment2], :author)
+
+  If both comments are associated to the same author, the first comment
+  will lose its nested `:permalink` association because the second comment
+  does not have it preloaded. To avoid this, you must preload the nested
+  associations as well.
+
+  If you want to reset the loaded fields, see `Ecto.reset_fields/2`.
 
   ## Options
 
@@ -962,6 +1168,9 @@ defmodule Ecto.Repo do
     * `:prefix` - the prefix to fetch preloads from. By default, queries
       will use the same prefix as the first struct in the given collection.
       This option allows the prefix to be changed.
+    * `:on_preloader_spawn` - when preloads are done in parallel, this function
+      will be called in the processes that perform the preloads. This can be useful
+      for context propagation for traces.
 
   See the ["Shared options"](#module-shared-options) section at the module
   documentation for more options.
@@ -987,7 +1196,10 @@ defmodule Ecto.Repo do
       query = from c in Comment, order_by: c.published_at
       posts = Repo.preload posts, [comments: {query, [:replies, :likes]}]
 
-  The query given to preload may also preload its own associations.
+      # Use a function for custom preloading
+      posts = Repo.preload posts, [comments: fn post_ids -> fetch_comments_by_post_ids(post_ids) end]
+
+  The query given to preload may also preload its own associations. See the ["preload queries"](Ecto.Query.html#preload/3-preload-queries) and ["preload functions"](Ecto.Query.html#preload/3-preload-functions) section of the `Ecto.Query.preload/3` for details on those.
   """
   @doc group: "Schema API"
   @callback preload(structs_or_struct_or_nil, preloads :: term, opts :: Keyword.t()) ::
@@ -1050,9 +1262,19 @@ defmodule Ecto.Repo do
   """
   @doc group: "User callbacks"
   @callback default_options(operation) :: Keyword.t()
-            when operation: :all | :insert_all | :update_all | :delete_all | :stream |
-                              :transaction | :insert | :update | :delete | :insert_or_update
-
+            when operation:
+                   :all
+                   | :delete
+                   | :delete_all
+                   | :insert
+                   | :insert_all
+                   | :insert_or_update
+                   | :preload
+                   | :reload
+                   | :stream
+                   | :transaction
+                   | :update
+                   | :update_all
   @doc """
   Fetches all entries from the data store matching the given query.
 
@@ -1064,7 +1286,7 @@ defmodule Ecto.Repo do
       in Postgres or the database in MySQL). This will be applied to all `from`
       and `join`s in the query that did not have a prefix previously given
       either via the `:prefix` option on `join`/`from` or via `@schema_prefix`
-      in the schema. For more information see the "Query Prefix" section of the
+      in the schema. For more information see the ["Query Prefix"](`m:Ecto.Query#module-query-prefix`) section of the
       `Ecto.Query` documentation.
 
   See the ["Shared options"](#module-shared-options) section at the module
@@ -1095,7 +1317,7 @@ defmodule Ecto.Repo do
       in Postgres or the database in MySQL). This will be applied to all `from`
       and `join`s in the query that did not have a prefix previously given
       either via the `:prefix` option on `join`/`from` or via `@schema_prefix`
-      in the schema. For more information see the "Query Prefix" section of the
+      in the schema. For more information see the ["Query Prefix"](`m:Ecto.Query#module-query-prefix`) section of the
       `Ecto.Query` documentation.
 
     * `:max_rows` - The number of rows to load from the database as we stream.
@@ -1134,8 +1356,11 @@ defmodule Ecto.Repo do
   ## Options
 
     * `:prefix` - The prefix to run the query on (such as the schema path
-      in Postgres or the database in MySQL). This overrides the prefix set
-      in the query and any `@schema_prefix` set in the schema.
+      in Postgres or the database in MySQL). This will be applied to all `from`
+      and `join`s in the query that did not have a prefix previously given
+      either via the `:prefix` option on `join`/`from` or via `@schema_prefix`
+      in the schema. For more information see the ["Query Prefix"](`m:Ecto.Query#module-query-prefix`) section of the
+      `Ecto.Query` documentation.
 
   See the ["Shared options"](#module-shared-options) section at the module
   documentation for remaining options.
@@ -1158,6 +1383,9 @@ defmodule Ecto.Repo do
       from(p in Post, where: p.id < 10, update: [set: [title: fragment("upper(?)", ^new_title)]])
       |> MyRepo.update_all([])
 
+      from(p in Post, where: p.id < 10, update: [set: [visits: p.visits * 1000]])
+      |> MyRepo.update_all([])
+
   """
   @doc group: "Query API"
   @callback update_all(
@@ -1177,8 +1405,11 @@ defmodule Ecto.Repo do
   ## Options
 
     * `:prefix` - The prefix to run the query on (such as the schema path
-      in Postgres or the database in MySQL). This overrides the prefix set
-      in the query and any `@schema_prefix` set in the schema.
+      in Postgres or the database in MySQL). This will be applied to all `from`
+      and `join`s in the query that did not have a prefix previously given
+      either via the `:prefix` option on `join`/`from` or via `@schema_prefix`
+      in the schema. For more information see the ["Query Prefix"](`m:Ecto.Query#module-query-prefix`) section of the
+      `Ecto.Query` documentation.
 
   See the ["Shared options"](#module-shared-options) section at the module
   documentation for remaining options.
@@ -1187,7 +1418,11 @@ defmodule Ecto.Repo do
 
       MyRepo.delete_all(Post)
 
-      from(p in Post, where: p.id < 10) |> MyRepo.delete_all
+      from(p in Post, where: p.id < 10) |> MyRepo.delete_all()
+
+      # With returning results, if supported by the database.
+      {_count, posts} = from(p in Post, where: p.id < 10, select: p) |> MyRepo.delete_all()
+
   """
   @doc group: "Query API"
   @callback delete_all(queryable :: Ecto.Queryable.t(), opts :: Keyword.t()) ::
@@ -1195,8 +1430,15 @@ defmodule Ecto.Repo do
 
   ## Ecto.Adapter.Schema
 
-  @optional_callbacks insert_all: 3, insert: 2, insert!: 2, update: 2, update!: 2,
-                      delete: 2, delete!: 2, insert_or_update: 2, insert_or_update!: 2,
+  @optional_callbacks insert_all: 3,
+                      insert: 2,
+                      insert!: 2,
+                      update: 2,
+                      update!: 2,
+                      delete: 2,
+                      delete!: 2,
+                      insert_or_update: 2,
+                      insert_or_update!: 2,
                       prepare_query: 3
 
   @doc """
@@ -1206,9 +1448,11 @@ defmodule Ecto.Repo do
   both (`{"users", MyApp.User}`) as the first argument. The second
   argument is a list of entries to be inserted, either as keyword
   lists or as maps. The keys of the entries are the field names as
-  atoms and the value should be the respective value for the field
-  type or, optionally, an `Ecto.Query` that returns a single entry
-  with a single value.
+  atoms, when a schema module is specified in the first argument.
+  Otherwise, the keys can be either atoms or strings representing
+  the names of the columns in the underlying datastore. The value
+  should be the respective value for the field type or, optionally,
+  an `Ecto.Query` that returns a single entry with a single value.
 
   It returns a tuple containing the number of entries
   and any returned result as second element. If the database
@@ -1247,7 +1491,7 @@ defmodule Ecto.Repo do
     * `:on_conflict` - It may be one of `:raise` (the default), `:nothing`,
       `:replace_all`, `{:replace_all_except, fields}`, `{:replace, fields}`,
       a keyword list of update instructions or an `Ecto.Query`
-      query for updates. See the "Upserts" section for more information.
+      query for updates. See the "[Upserts](#c:insert_all/3-upserts)" section for more information.
 
     * `:conflict_target` - A list of column names to verify for conflicts.
       It is expected those columns to have unique indexes on them that may conflict.
@@ -1255,11 +1499,11 @@ defmodule Ecto.Repo do
       It may also be `{:unsafe_fragment, binary_fragment}` to pass any
       expression to the database without any sanitization, this is useful
       for partial index or index with expressions, such as
-      `{:unsafe_fragment, "(coalesce(firstname, ""), coalesce(lastname, "")) WHERE middlename IS NULL"}` for
-      `ON CONFLICT (coalesce(firstname, ""), coalesce(lastname, "")) WHERE middlename IS NULL` SQL query.
+      `{:unsafe_fragment, "(coalesce(firstname, ''), coalesce(lastname, '')) WHERE middlename IS NULL"}` for
+      `ON CONFLICT (coalesce(firstname, ''), coalesce(lastname, '')) WHERE middlename IS NULL` SQL query.
 
     * `:placeholders` - A map with placeholders. This feature is not supported
-      by all databases. See the "Placeholders" section for more information.
+      by all databases. See the ["Placeholders" section](#c:insert_all/3-placeholders) for more information.
 
   See the ["Shared options"](#module-shared-options) section at the module
   documentation for remaining options.
@@ -1268,7 +1512,8 @@ defmodule Ecto.Repo do
 
   A query can be given instead of a list with entries. This query needs to select
   into a map containing only keys that are available as writeable columns in the
-  schema.
+  schema. This will query and insert the values all inside one query, without
+  another round trip to the application.
 
   ## Examples
 
@@ -1366,10 +1611,12 @@ defmodule Ecto.Repo do
   """
   @doc group: "Schema API"
   @callback insert_all(
-              schema_or_source :: binary | {binary, module} | module,
-              entries_or_query :: [%{atom => value} | Keyword.t(value)] | Ecto.Query.t,
+              schema_or_source :: binary() | {binary(), module()} | module(),
+              entries_or_query ::
+                [%{(atom() | String.t()) => value} | Keyword.t(value)] | Ecto.Query.t(),
               opts :: Keyword.t()
-            ) :: {non_neg_integer, nil | [term]} when value: term | Ecto.Query.t()
+            ) :: {non_neg_integer(), nil | [term()]}
+            when value: term() | Ecto.Query.t()
 
   @doc """
   Inserts a struct defined via `Ecto.Schema` or a changeset.
@@ -1390,22 +1637,25 @@ defmodule Ecto.Repo do
 
     * `:returning` - selects which fields to return. It accepts a list
       of fields to be returned from the database. When `true`, returns
-      all fields. When `false`, no extra fields are returned. It will
-      always include all fields in `read_after_writes` as well as any
-      autogenerated id. Not all databases support this option and it
-      may not be available during upserts. See the "Upserts" section
-      for more information.
+      all fields, including those marked as `load_in_query: false`. When
+      `false`, no extra fields are returned. It will always include all
+      fields in `read_after_writes` as well as any autogenerated id. Be
+      aware that the fields returned from the database overwrite what was
+      supplied by the user. Any field not returned by the database will be
+      present with the original value supplied by the user. Not all databases
+      support this option and it may not be available during upserts.
+      See the ["Upserts"](`c:insert/2#upserts`) section for more information.
 
     * `:prefix` - The prefix to run the query on (such as the schema path
       in Postgres or the database in MySQL). This overrides the prefix set
-      in the query and any `@schema_prefix` set any schemas. Also, the
+      in the query and any `@schema_prefix` set on any schemas. Also, the
       `@schema_prefix` for the parent record will override all default
       `@schema_prefix`s set in any child schemas for associations.
 
     * `:on_conflict` - It may be one of `:raise` (the default), `:nothing`,
       `:replace_all`, `{:replace_all_except, fields}`, `{:replace, fields}`,
       a keyword list of update instructions or an `Ecto.Query` query for updates.
-      See the "Upserts" section for more information.
+      See the ["Upserts"](`c:insert/2#upserts`) section for more information.
 
     * `:conflict_target` - A list of column names to verify for conflicts.
       It is expected those columns to have unique indexes on them that may conflict.
@@ -1422,6 +1672,10 @@ defmodule Ecto.Repo do
 
     * `:stale_error_message` - The message to add to the configured
       `:stale_error_field` when stale errors happen, defaults to "is stale".
+
+    * `:allow_stale` - Doesn't error when structs are stale. Defaults to `false`.
+      This may happen if there are rules or triggers in the database that
+      rejects the insert operation. This option cascades to associations.
 
   See the ["Shared options"](#module-shared-options) section at the module
   documentation for more options.
@@ -1521,7 +1775,9 @@ defmodule Ecto.Repo do
 
     * Specify `read_after_writes: true` in your schema for choosing
       fields that are read from the database after every operation.
-      Or pass `returning: true` to `insert` to read all fields back:
+      Or pass `returning: true` to `insert` to read all fields back.
+      (Note that it will only read from the database if at least one
+      field is updated).
 
           MyRepo.insert(%Post{title: "this is unique"}, returning: true,
                         on_conflict: on_conflict, conflict_target: :title)
@@ -1537,6 +1793,32 @@ defmodule Ecto.Repo do
   inserting a struct with associations and using the `:on_conflict` option
   at the same time is not recommended, as Ecto will be unable to actually
   track the proper status of the association.
+
+  ## Advanced Upserts
+
+  Using an `Ecto.Query` for `:on_conflict` can allow us to use more advanced
+  database features. For example, PostgreSQL supports conditional upserts like
+  `DO UPDATE SET title = EXCLUDED.title, version = EXCLUDED.version
+  WHERE EXCLUDED.version > post.version`.
+  This means that the title and version will be updated only if the proposed
+  row has a greater version value than the existing row.
+
+  Ecto can support this as follows:
+
+      conflict_query =
+        from(p in Post,
+          update: [set: [
+            title: fragment("EXCLUDED.title"),
+            version: fragment("EXCLUDED.version")
+            ]],
+          where: fragment("EXCLUDED.version > ?", p.version)
+        )
+
+      MyRepo.insert(
+        %Post{id: 1, title: "Ecto Upserts (Dance Remix)", version: 2},
+        conflict_target: [:id],
+        on_conflict: conflict_query
+      )
   """
   @doc group: "Schema API"
   @callback insert(
@@ -1566,9 +1848,12 @@ defmodule Ecto.Repo do
 
     * `:returning` - selects which fields to return. It accepts a list
       of fields to be returned from the database. When `true`, returns
-      all fields. When `false`, no extra fields are returned. It will
-      always include all fields in `read_after_writes`. Not all
-      databases support this option.
+      all fields, including those marked as `load_in_query: false`. When
+      `false`, no extra fields are returned. It will always include all
+      fields in `read_after_writes`. Be aware that the fields returned
+      from the database overwrite what was supplied by the user. Any field
+      not returned by the database will be present with the original value
+      supplied by the user. Not all databases support this option.
 
     * `:force` - By default, if there are no changes in the changeset,
       `c:update/2` is a no-op. By setting this option to true, update
@@ -1577,7 +1862,7 @@ defmodule Ecto.Repo do
 
     * `:prefix` - The prefix to run the query on (such as the schema path
       in Postgres or the database in MySQL). This overrides the prefix set
-      in the query and any `@schema_prefix` set any schemas. Also, the
+      in the query and any `@schema_prefix` set on any schemas. Also, the
       `@schema_prefix` for the parent record will override all default
       `@schema_prefix`s set in any child schemas for associations.
 
@@ -1587,6 +1872,11 @@ defmodule Ecto.Repo do
 
     * `:stale_error_message` - The message to add to the configured
       `:stale_error_field` when stale errors happen, defaults to "is stale".
+
+    * `:allow_stale` - Doesn't error if update is stale. Defaults to `false`.
+      This may happen if the struct has been deleted from the database before
+      the update or if there is a rule or a trigger on the database that rejects
+      the update operation. This option cascades to associations.
 
   See the ["Shared options"](#module-shared-options) section at the module
   documentation for more options.
@@ -1632,6 +1922,8 @@ defmodule Ecto.Repo do
     * `:stale_error_message` - The message to add to the configured
       `:stale_error_field` when stale errors happen, defaults to "is stale".
       Only applies to updates.
+    * `:allow_stale` - Doesn't error when structs are stale. Defaults to `false`.
+      This option cascades to associations.
 
   See the ["Shared options"](#module-shared-options) section at the module
   documentation for more options.
@@ -1672,6 +1964,15 @@ defmodule Ecto.Repo do
 
   ## Options
 
+    * `:returning` - selects which fields to return. It accepts a list
+      of fields to be returned from the database. When `true`, returns
+      all fields, including those marked as `load_in_query: false`. When
+      `false`, no extra fields are returned. It will always include all
+      fields in `read_after_writes`. Be aware that the fields returned
+      from the database overwrite what was supplied by the user. Any field
+      not returned by the database will be present with the original value
+      supplied by the user. Not all databases support this option.
+
     * `:prefix` - The prefix to run the query on (such as the schema path
       in Postgres or the database in MySQL). This overrides the prefix set
       in the query and any `@schema_prefix` set in the schema.
@@ -1682,6 +1983,11 @@ defmodule Ecto.Repo do
 
     * `:stale_error_message` - The message to add to the configured
       `:stale_error_field` when stale errors happen, defaults to "is stale".
+
+    * `:allow_stale` - Doesn't error if delete is stale. Defaults to `false`.
+      This may happen if the struct has been deleted from the database before
+      this deletion or if there is a rule or a trigger on the database that rejects
+      the delete operation.
 
   See the ["Shared options"](#module-shared-options) section at the module
   documentation for more options.
@@ -1801,7 +2107,7 @@ defmodule Ecto.Repo do
           # operation will raise an exception.
         end)
 
-  See the "Aborted transactions" section for more examples of aborted
+  See the ["Aborted transactions"](`c:transaction/2#aborted-transactions`) section for more examples of aborted
   transactions and how to handle them.
 
   In practice, managing nested transactions can become complex quickly.
@@ -1828,9 +2134,9 @@ defmodule Ecto.Repo do
 
   ## Aborted transactions
 
-  When an operation inside a transaction fails, the transaction is aborted in the database. 
-  For instance, if you attempt an insert that violates a unique constraint, the insert fails 
-  and the transaction is aborted. In such cases, any further operation inside the transaction 
+  When an operation inside a transaction fails, the transaction is aborted in the database.
+  For instance, if you attempt an insert that violates a unique constraint, the insert fails
+  and the transaction is aborted. In such cases, any further operation inside the transaction
   will raise exceptions.
 
   Take the following transaction as an example:
@@ -1846,27 +2152,27 @@ defmodule Ecto.Repo do
       end)
 
   If the changeset is valid, but the insert operation fails due to a database constraint,
-  the subsequent `repo.insert(%Failure{})` operation will raise an exception because the
-  database has already aborted the transaction and thus making the operation invalid.
+  the subsequent `repo.insert(%Status{value: "failure"})` operation will raise an exception
+  because the database has already aborted the transaction and thus making the operation invalid.
   In Postgres, the exception would look like this:
-  
+
       ** (Postgrex.Error) ERROR 25P02 (in_failed_sql_transaction) current transaction is aborted, commands ignored until end of transaction block
-      
-  If the changeset is invalid before it reaches the database due to a validation error, 
-  no statement is sent to the database, an `:error` tuple is returned, and `repo.insert(%Failure{})` 
-  operation will execute as usual. 
+
+  If the changeset is invalid before it reaches the database due to a validation error,
+  no statement is sent to the database, an `:error` tuple is returned, and `repo.insert(%Status{value: "failure"})`
+  operation will execute as usual.
 
   We have two options to deal with such scenarios:
-  
-  If don't want to change the semantics of your code,  you can also use the savepoints 
-  feature by passing the `:mode` option like this: `repo.insert(changeset, mode: :savepoint)`. 
-  In case of an exception, the transaction will rollback to the savepoint and prevent 
+
+  If you don't want to change the semantics of your code,  you can also use the savepoints
+  feature by passing the `:mode` option like this: `repo.insert(changeset, mode: :savepoint)`.
+  In case of an exception, the transaction will rollback to the savepoint and prevent
   the transaction from failing.
 
-  Another alternative is to handle this operation outside of the transaction. 
-  For example, you can choose to perform an explicit `repo.rollback` call in the 
-  `{:error, changeset}` clause and then perform the `repo.insert(%Failure{})` outside 
-  of the transaction. You might also consider using `Ecto.Multi`, as they automatically 
+  Another alternative is to handle this operation outside of the transaction.
+  For example, you can choose to perform an explicit `repo.rollback` call in the
+  `{:error, changeset}` clause and then perform the `repo.insert(%Status{value: "failure"})` outside
+  of the transaction. You might also consider using `Ecto.Multi`, as they automatically
   rollback whenever an operation fails.
 
   ## Working with processes
@@ -1875,7 +2181,7 @@ defmodule Ecto.Repo do
   transaction won't be part of the same transaction and will use a separate
   connection altogether.
 
-  When using the the `Ecto.Adapters.SQL.Sandbox` in tests, while it may be
+  When using the `Ecto.Adapters.SQL.Sandbox` in tests, while it may be
   possible to share the connection between processes, the parent process
   will typically hold the connection until the transaction completes. This
   may lead to a deadlock if the child process attempts to use the same connection.
@@ -1892,7 +2198,7 @@ defmodule Ecto.Repo do
   @callback transaction(fun_or_multi :: fun | Ecto.Multi.t(), opts :: Keyword.t()) ::
               {:ok, any}
               | {:error, any}
-              | {:error, Ecto.Multi.name(), any, %{Ecto.Multi.name() => any}}
+              | Ecto.Multi.failure()
 
   @doc """
   Returns true if the current process is inside a transaction.
